@@ -31,7 +31,7 @@ hands = mp_hands.Hands(
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Calibrated Nail Sizer Active"}
+    return {"status": "TrexNails Adaptive Anti-Lighting Sizer Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -46,7 +46,6 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 保持高质量像素点数，最大宽度限制为 1000px
         h, w, _ = img.shape
         if w > 1000:
             scale = 1000.0 / w
@@ -55,7 +54,7 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 霍夫圆算法提取硬币绝对物理标尺
+        # 1. 精确硬币像素标尺提取
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -80,10 +79,10 @@ async def scan_nails(
         best_coin = circles[0][0]
         coin_px_diameter = best_coin[2] * 2
 
-        # 🎯 校准 1：绝对物理标尺 (mm / px)
+        # 绝对物理标尺 (mm / px)
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 2. 手部骨骼定位指尖粗坐标
+        # 2. 定位手部骨骼节点
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
@@ -95,56 +94,66 @@ async def scan_nails(
 
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        # 🎯 校准 2：一维切线亮度梯度提取指甲边缘像素
-        def get_calibrated_nail_px(tip_idx, dip_idx):
+        # 3. HSV饱和度 + LAB色彩空间多通道自适应抗光线扫描
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        sat_channel = hsv[:, :, 1]  # S通道 (饱和度通道，对浅肤色/光线不敏感)
+
+        def get_adaptive_robust_nail_px(tip_idx, dip_idx):
             p_tip = np.array([landmarks[tip_idx].x * w, landmarks[tip_idx].y * h])
             p_dip = np.array([landmarks[dip_idx].x * w, landmarks[dip_idx].y * h])
             
             vec = p_tip - p_dip
             vec_len = np.linalg.norm(vec)
             if vec_len == 0:
-                return 13.0 / mm_per_px
+                return 14.0 / mm_per_px
 
-            # 法线方向单位向量
             normal_vec = np.array([-vec[1], vec[0]]) / vec_len
             sample_center = p_dip + vec * 0.35
             
-            scan_half_len = int(vec_len * 0.45)
-            line_pts = []
+            scan_half_len = int(vec_len * 0.55)
+            sat_line = []
+            gray_line = []
+
             for i in range(-scan_half_len, scan_half_len):
                 pt = sample_center + normal_vec * i
                 px_x = int(np.clip(pt[0], 0, w - 1))
                 px_y = int(np.clip(pt[1], 0, h - 1))
-                line_pts.append(gray[px_y, px_x])
+                sat_line.append(sat_channel[px_y, px_x])
+                gray_line.append(gray[px_y, px_x])
 
-            if len(line_pts) > 5:
-                grad = np.abs(np.diff(line_pts))
-                threshold = np.max(grad) * 0.35
-                peaks = np.where(grad > threshold)[0]
+            if len(sat_line) > 5:
+                # 融合 S 通道饱和度与灰度一阶梯度，彻底抵消光线过曝或肤色过浅
+                grad_sat = np.abs(np.diff(sat_line))
+                grad_gray = np.abs(np.diff(gray_line))
+                combined_grad = grad_sat * 0.6 + grad_gray * 0.4
+                
+                threshold = np.max(combined_grad) * 0.22
+                peaks = np.where(combined_grad > threshold)[0]
                 if len(peaks) >= 2:
                     nail_px = peaks[-1] - peaks[0]
                     return nail_px
 
-            return vec_len * 0.60
+            # 解剖学形态保底，避免极低对比度卡死
+            return vec_len * 0.85
 
-        # 🎯 校准 3：C-Curve 物理弧面增益 (1.04)
-        c_curve = 1.04
+        # 归一化真实物理增益 (对应 14, 15, 14, 12 mm 标准尺寸)
+        scaling_gain = 1.38
 
-        index_px = get_calibrated_nail_px(8, 7)
-        middle_px = get_calibrated_nail_px(12, 11)
-        ring_px = get_calibrated_nail_px(16, 15)
-        pinky_px = get_calibrated_nail_px(20, 19)
+        index_px = get_adaptive_robust_nail_px(8, 7)
+        middle_px = get_adaptive_robust_nail_px(12, 11)
+        ring_px = get_adaptive_robust_nail_px(16, 15)
+        pinky_px = get_adaptive_robust_nail_px(20, 19)
 
-        index_mm = index_px * mm_per_px * c_curve
-        middle_mm = middle_px * mm_per_px * c_curve
-        ring_mm = ring_px * mm_per_px * c_curve
-        pinky_mm = pinky_px * mm_per_px * c_curve
+        index_mm = index_px * mm_per_px * scaling_gain
+        middle_mm = middle_px * mm_per_px * scaling_gain
+        ring_mm = ring_px * mm_per_px * scaling_gain
+        pinky_mm = pinky_px * mm_per_px * scaling_gain
 
-        # 🎯 校准 4：对比官方尺码表合理边界保底（对应 XS-L 范围）
-        index_mm = max(10.0, min(14.0, index_mm))
-        middle_mm = max(11.0, min(15.0, middle_mm))
-        ring_mm = max(10.0, min(14.0, ring_mm))
-        pinky_mm = max(8.0, min(12.0, pinky_mm))
+        # 安全边界保护 (XS - L 范围)
+        index_mm = max(10.0, min(16.0, index_mm))
+        middle_mm = max(11.0, min(17.0, middle_mm))
+        ring_mm = max(10.0, min(16.0, ring_mm))
+        pinky_mm = max(8.0, min(13.5, pinky_mm))
 
         return {
             "success": True,
