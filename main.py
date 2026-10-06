@@ -14,7 +14,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-mp_hands = mp.solutions.hands.Hands(
+# 显式使用 mp.solutions.hands[cite: 8]
+mp_hands_solution = mp.solutions.hands
+hands = mp_hands_solution.Hands(
     static_image_mode=True, 
     max_num_hands=1, 
     min_detection_confidence=0.6
@@ -34,7 +36,7 @@ async def scan_nails(file: UploadFile = File(...)):
         if img is None:
             return {"success": False, "message": "Photo invalide ou floue."}
 
-        # 1. 灰度化与硬币检测 (霍夫圆与椭圆校正)
+        # 1. 灰度化与硬币检测
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (9, 9), 2)
         
@@ -62,9 +64,9 @@ async def scan_nails(file: UploadFile = File(...)):
         # 2€ 硬币 25.75mm 标尺
         mm_per_px = 25.75 / coin_px_diameter
 
-        # 2. MediaPipe AI 识别手部关键点
+        # 2. AI 手部关键点识别
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = mp_hands.process(img_rgb)
+        results = hands.process(img_rgb)
 
         if not results.multi_hand_landmarks:
             return {
