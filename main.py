@@ -26,12 +26,12 @@ hands = mp_hands.Hands(
     static_image_mode=True,
     max_num_hands=1,
     model_complexity=0,
-    min_detection_confidence=0.1
+    min_detection_confidence=0.3
 )
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Pure Physical Dynamic Calibration Active"}
+    return {"status": "TrexNails Strict Commercial Sizer Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -44,9 +44,8 @@ async def scan_nails(
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            return {"success": False, "message": "Photo invalide."}
+            return {"success": False, "message": "Photo invalide ou floue. Veuillez reprendre une photo claire."}
 
-        # 保持原生清晰度，防止像素丢失
         h, w, _ = img.shape
         if w > 1000:
             scale = 1000.0 / w
@@ -55,7 +54,7 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 精确硬币像素标尺提取 (霍夫圆与长轴校准)
+        # 1. 硬币精确度严肃拦截
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -73,91 +72,89 @@ async def scan_nails(
         if circles is None:
             return {
                 "success": False, 
-                "message": f"Pièce ({coin_type.upper()}) non détectée ! Posez la pièce bien à plat sur la table."
+                "message": f"Impossible de détecter la pièce de {coin_type.upper()}. Veuillez poser la pièce bien à plat à côté de vos doigts sur une surface dégagée."
             }
 
         circles = np.uint16(np.around(circles))
         best_coin = circles[0][0]
         coin_px_diameter = best_coin[2] * 2
 
-        # 物理标尺：1 像素 = 多少毫米
+        if coin_px_diameter < 20:
+            return {
+                "success": False,
+                "message": "La pièce est trop petite ou trop éloignée. Rapprochez votre appareil photo."
+            }
+
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 2. 定位手部骨骼节点与姿态解算
+        # 2. 手部与指甲姿态严肃校验
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
         if not results.multi_hand_landmarks:
             return {
                 "success": False, 
-                "message": "Main non détectée. Assurez-vous que vos 4 doigts sont bien à plat."
+                "message": "Main non détectée. Veillez à bien poser vos 4 doigts à plat sous un bon éclairage."
             }
 
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        # 3. 自适应动态几何边缘与弧长还原算法（零硬编码）
-        def get_dynamic_physical_nail_mm(tip_idx, dip_idx):
+        # 3. 真实物理切线采样（若边缘对比度不足直接返回 None，绝不瞎猜）
+        def get_strict_nail_px(tip_idx, dip_idx):
             p_tip = np.array([landmarks[tip_idx].x * w, landmarks[tip_idx].y * h])
             p_dip = np.array([landmarks[dip_idx].x * w, landmarks[dip_idx].y * h])
             
-            # 手指三维向量与倾斜角补偿
             vec = p_tip - p_dip
             vec_len = np.linalg.norm(vec)
             if vec_len == 0:
-                return 12.0
+                return None
 
-            # 法线方向单位向量
             normal_vec = np.array([-vec[1], vec[0]]) / vec_len
             sample_center = p_dip + vec * 0.35
-
-            # 构建自适应 ROI 局部图像
-            roi_size = int(vec_len * 0.8)
-            x_min = max(0, int(sample_center[0] - roi_size))
-            x_max = min(w, int(sample_center[0] + roi_size))
-            y_min = max(0, int(sample_center[1] - roi_size))
-            y_max = min(h, int(sample_center[1] + roi_size))
-
-            roi_gray = gray[y_min:y_max, x_min:x_max]
             
-            if roi_gray.size > 0:
-                # 根据当前照片光线，计算自适应动态 Canny 阈值
-                median_val = np.median(roi_gray)
-                lower_thresh = int(max(0, 0.66 * median_val))
-                upper_thresh = int(min(255, 1.33 * median_val))
-                
-                edges = cv2.Canny(roi_gray, lower_thresh, upper_thresh)
-                
-                # 在垂直法线方向提取边缘像素连通距离
-                row_spans = []
-                for row in edges:
-                    pts = np.where(row > 0)[0]
-                    if len(pts) >= 2:
-                        row_spans.append(pts[-1] - pts[0])
-                
-                if row_spans:
-                    # 取 90% 分位数避免噪点干扰
-                    nail_2d_px = np.percentile(row_spans, 90)
-                    nail_2d_mm = nail_2d_px * mm_per_px
-                    
-                    # 动态 C-Curve 弧面还原公式 (将 2D 平面投影还原为 3D 真实物理弧长)
-                    # 正常指甲 C-Curve 弧度约为 35°~45°，对应物理展开增益因子为 ~1.28
-                    dynamic_c_curve_factor = 1.28
-                    return nail_2d_mm * dynamic_c_curve_factor
+            scan_half_len = int(vec_len * 0.55)
+            line_pts = []
+            for i in range(-scan_half_len, scan_half_len):
+                pt = sample_center + normal_vec * i
+                px_x = int(np.clip(pt[0], 0, w - 1))
+                px_y = int(np.clip(pt[1], 0, h - 1))
+                line_pts.append(gray[px_y, px_x])
 
-            # 动态几何兜底 (基于 3D 指骨解剖结构比例)
-            return (vec_len * 0.42) * mm_per_px * 1.28
+            if len(line_pts) > 5:
+                grad = np.abs(np.diff(line_pts))
+                threshold = np.max(grad) * 0.18
+                peaks = np.where(grad > threshold)[0]
+                
+                # 严苛校验：指甲两侧必须都存在清晰的物理边缘峰值
+                if len(peaks) >= 2:
+                    nail_px = peaks[-1] - peaks[0]
+                    # 检查像素合理性（避免抓到手指外边缘）
+                    if 10 < nail_px < (vec_len * 1.3):
+                        return nail_px
 
-        # 4. 纯物理方程独立解算 4 指物理毫米数
-        index_mm = get_dynamic_physical_nail_mm(8, 7)
-        middle_mm = get_dynamic_physical_nail_mm(12, 11)
-        ring_mm = get_dynamic_physical_nail_mm(16, 15)
-        pinky_mm = get_dynamic_physical_nail_mm(20, 19)
+            # 边缘不清晰或没找到：严肃返回 None，拒绝猜数据
+            return None
 
-        # 官方尺码表边界物理拦截 (XS - L 范围)
-        index_mm = max(10.0, min(16.0, index_mm))
-        middle_mm = max(11.0, min(17.0, middle_mm))
-        ring_mm = max(10.0, min(16.0, ring_mm))
-        pinky_mm = max(8.0, min(13.5, pinky_mm))
+        # 物理弧面展开系数 (3D 真实弧长标准)
+        c_curve_gain = 1.05
+
+        index_px = get_strict_nail_px(8, 7)
+        middle_px = get_strict_nail_px(12, 11)
+        ring_px = get_strict_nail_px(16, 15)
+        pinky_px = get_strict_nail_px(20, 19)
+
+        # 只要有任何一根手指无法清晰定位指甲边缘，绝对不乱给，直接阻断报错提示顾客！
+        if index_px is None or middle_px is None or ring_px is None or pinky_px is None:
+            return {
+                "success": False,
+                "message": "Contours des ongles flous. Veuillez reprendre la photo sous un éclairage direct, sur ongles nus et sans ombre."
+            }
+
+        # 纯真实物理转换（无硬编码截断，全由边缘切线与硬币标尺直接算得）
+        index_mm = index_px * mm_per_px * c_curve_gain
+        middle_mm = middle_px * mm_per_px * c_curve_gain
+        ring_mm = ring_px * mm_per_px * c_curve_gain
+        pinky_mm = pinky_px * mm_per_px * c_curve_gain
 
         return {
             "success": True,
@@ -170,4 +167,4 @@ async def scan_nails(
             }
         }
     except Exception as e:
-        return {"success": False, "message": "Erreur d'analyse photo."}
+        return {"success": False, "message": "Erreur d'analyse. Merci de re-prendre une photo bien nette."}
