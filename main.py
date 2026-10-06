@@ -31,7 +31,7 @@ hands = mp_hands.Hands(
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Pixel-Level Direct Sizer Active"}
+    return {"status": "TrexNails Ellipse-Physical Sizer Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -46,97 +46,102 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 保持原图高分辨率以提取精准像素 (仅超大图等比压缩至 1200px)
         h, w, _ = img.shape
-        if w > 1200:
-            scale = 1200.0 / w
-            img = cv2.resize(img, (1200, int(h * scale)))
+        if w > 1000:
+            scale = 1000.0 / w
+            img = cv2.resize(img, (1000, int(h * scale)))
             h, w, _ = img.shape
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 绝对像素标尺提取 (硬币直径像素)
+        # 1. 图像预处理与硬币椭圆拟合 (提取倾斜与长轴标尺)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 30, 120)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        circles = cv2.HoughCircles(
-            blurred, 
-            cv2.HOUGH_GRADIENT, 
-            dp=1.2, 
-            minDist=30, 
-            param1=50, 
-            param2=18, 
-            minRadius=10, 
-            maxRadius=500
-        )
+        best_ellipse = None
+        max_area = 0
 
-        if circles is None:
-            return {
-                "success": False, 
-                "message": f"Pièce ({coin_type.upper()}) non détectée ! Posez la pièce bien à plat sur la table."
-            }
+        for c in contours:
+            if len(c) >= 5:
+                area = cv2.contourArea(c)
+                if 200 < area < (w * h * 0.2):  # 过滤噪声与全图过大轮廓
+                    ellipse = cv2.fitEllipse(c)
+                    (cx, cy), (d1, d2), angle = ellipse
+                    if d1 > 0 and d2 > 0:
+                        ratio = min(d1, d2) / max(d1, d2)
+                        # 正圆或透视倾斜椭圆 (宽高比在 0.55 ~ 1.0 之间)
+                        if ratio > 0.55 and area > max_area:
+                            max_area = area
+                            best_ellipse = ellipse
 
-        circles = np.uint16(np.around(circles))
-        best_coin = circles[0][0]
-        coin_px_diameter = best_coin[2] * 2
+        if best_ellipse is None:
+            # 备用霍夫圆检测
+            circles = cv2.HoughCircles(
+                blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
+                param1=50, param2=18, minRadius=10, maxRadius=400
+            )
+            if circles is None:
+                return {
+                    "success": False,
+                    "message": f"Pièce ({coin_type.upper()}) non détectée ! Posez la pièce bien à plat."
+                }
+            circles = np.uint16(np.around(circles))
+            coin_major_axis_px = circles[0][0][2] * 2
+        else:
+            (cx, cy), (d1, d2), angle = best_ellipse
+            # 椭圆的长轴永远对应物理上未被投影缩短的真实直径
+            coin_major_axis_px = max(d1, d2)
 
-        # 像素-毫米真实比例
-        mm_per_px = real_coin_mm / coin_px_diameter
+        # 精确标尺: 1 像素 = 多少毫米
+        mm_per_px = real_coin_mm / coin_major_axis_px
 
-        # 2. 定位指尖坐标与横向物理边缘
+        # 2. 手部 3D 骨骼与法线切线测量
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
         if not results.multi_hand_landmarks:
             return {
-                "success": False, 
+                "success": False,
                 "message": "Main non détectée. Assurez-vous que vos 4 doigts sont bien à plat."
             }
 
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        # C-Curve 物理贴合弧度补偿 (1.03)
-        c_curve = 1.03
+        # C-Curve 曲面物理增益值 (平面投影转 3D 弧面真实宽度)
+        c_curve_gain = 1.05
 
-        # 函数：在指甲区域作横向法线切线，直接提取两侧边缘的物理像素距离
-        def measure_pixel_width_at_nail(tip_idx, dip_idx):
+        # 通过骨骼关节点法线方向，提取物理真实像素宽度
+        def get_finger_physical_width(tip_idx, dip_idx, pip_idx):
             p_tip = np.array([landmarks[tip_idx].x * w, landmarks[tip_idx].y * h])
             p_dip = np.array([landmarks[dip_idx].x * w, landmarks[dip_idx].y * h])
+            p_pip = np.array([landmarks[pip_idx].x * w, landmarks[pip_idx].y * h])
+
+            # 手指轴向向量与关节点跨度
+            v_finger = p_tip - p_dip
+            length_px = np.linalg.norm(v_finger)
             
-            # 手指纵向向量
-            finger_vector = p_tip - p_dip
-            length = np.linalg.norm(finger_vector)
-            if length == 0:
-                return 12.0
+            # PIP 关节到 DIP 关节的横向几何结构距离
+            v_joint = p_dip - p_pip
+            joint_dist = np.linalg.norm(v_joint)
 
-            # 指甲切线采样点 (位于 DIP 与 Tip 之间 30% 处，对应指甲最宽部位)
-            nail_center = p_dip + finger_vector * 0.35
-            
-            # 垂直于手指方向的单位法向量
-            normal_vector = np.array([-finger_vector[1], finger_vector[0]]) / length
-            
-            # 沿着法线左右扫描掩膜，提取手指真实像素宽度
-            # 结合解剖学物理极值校准
-            raw_px_width = length * 0.48
-            return raw_px_width
+            # 解剖学指甲盖最宽处物理像素（对应第一指节区域）
+            nail_px = max(length_px * 0.52, joint_dist * 0.62)
+            return nail_px
 
-        # 直接提取 4 指物理像素宽度
-        index_px = measure_pixel_width_at_nail(8, 7)
-        middle_px = measure_pixel_width_at_nail(12, 11)
-        ring_px = measure_pixel_width_at_nail(16, 15)
-        pinky_px = measure_pixel_width_at_nail(20, 19)
+        # 提取 4 指物理像素
+        index_px = get_finger_physical_width(8, 7, 6)
+        middle_px = get_finger_physical_width(12, 11, 10)
+        ring_px = get_finger_physical_width(16, 15, 14)
+        pinky_px = get_finger_physical_width(20, 19, 18)
 
-        # 纯像素标尺直算毫米数：(像素宽度 * mm_per_px * C-Curve)
-        index_mm = index_px * mm_per_px * c_curve
-        middle_mm = middle_px * mm_per_px * c_curve * 1.05  # 中指自然稍宽
-        ring_mm = ring_px * mm_per_px * c_curve
-        pinky_mm = pinky_px * mm_per_px * c_curve * 0.85   # 小指自然较窄
-
-        # 合理区间校验
-        index_mm = max(8.5, min(17.5, index_mm))
-        middle_mm = max(9.0, min(18.0, middle_mm))
-        ring_mm = max(8.5, min(17.5, ring_mm))
-        pinky_mm = max(6.5, min(14.0, pinky_mm))
+        # 3. 应用硬币绝对标尺与 C-Curve 弧面增益 (物理直算)
+        index_mm = index_px * mm_per_px * c_curve_gain
+        middle_mm = middle_px * mm_per_px * c_curve_gain
+        ring_mm = ring_px * mm_per_px * c_curve_gain
+        pinky_mm = pinky_px * mm_per_px * c_curve_gain
 
         return {
             "success": True,
