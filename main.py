@@ -54,7 +54,7 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 精确硬币直径提取 (像素标尺)
+        # 1. 霍夫圆算法精准扫描硬币
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -79,10 +79,9 @@ async def scan_nails(
         best_coin = circles[0][0]
         coin_px_diameter = best_coin[2] * 2
 
-        # 物理标尺 (mm / px)
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 2. AI 手部骨骼横向极值定位
+        # 2. AI 骨骼跨度计算
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
@@ -94,7 +93,6 @@ async def scan_nails(
 
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        # 计算食指指节 (Landmark 5/8) 到 小指指节 (Landmark 17/20) 的横向跨越总像素值
         index_x = landmarks[8].x * w
         index_y = landmarks[8].y * h
         pinky_x = landmarks[20].x * w
@@ -102,20 +100,20 @@ async def scan_nails(
 
         hand_horizontal_span_px = math.sqrt((index_x - pinky_x)**2 + (index_y - pinky_y)**2)
 
-        # C-Curve 微调系数 (1.02)
-        c_curve = 1.02
+        # 🎯 精细衰减校准系数（针对真实甲床宽度进行 20% 比例下调）
+        # 将原 0.270 / 0.290 / 0.230 调整为对应 14, 15, 14, 12 mm 模型的物理系数
+        c_curve = 1.01
 
-        # 🎯 精确横向物理分割比例 (对应 14, 15, 14, 12 mm 实测模型)
-        index_mm = (hand_horizontal_span_px * 0.270) * mm_per_px * c_curve
-        middle_mm = (hand_horizontal_span_px * 0.290) * mm_per_px * c_curve
-        ring_mm = (hand_horizontal_span_px * 0.270) * mm_per_px * c_curve
-        pinky_mm = (hand_horizontal_span_px * 0.230) * mm_per_px * c_curve
+        index_mm = (hand_horizontal_span_px * 0.222) * mm_per_px * c_curve
+        middle_mm = (hand_horizontal_span_px * 0.238) * mm_per_px * c_curve
+        ring_mm = (hand_horizontal_span_px * 0.222) * mm_per_px * c_curve
+        pinky_mm = (hand_horizontal_span_px * 0.190) * mm_per_px * c_curve
 
-        # 合理区间校准
-        index_mm = max(8.5, min(16.5, index_mm))
-        middle_mm = max(9.0, min(17.0, middle_mm))
-        ring_mm = max(8.5, min(16.5, ring_mm))
-        pinky_mm = max(6.5, min(13.5, pinky_mm))
+        # 截断与保护
+        index_mm = max(8.0, min(16.5, index_mm))
+        middle_mm = max(8.5, min(17.0, middle_mm))
+        ring_mm = max(8.0, min(16.5, ring_mm))
+        pinky_mm = max(6.0, min(13.5, pinky_mm))
 
         return {
             "success": True,
