@@ -14,12 +14,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 显式使用 mp.solutions.hands[cite: 8]
 mp_hands_solution = mp.solutions.hands
 hands = mp_hands_solution.Hands(
     static_image_mode=True, 
     max_num_hands=1, 
-    min_detection_confidence=0.6
+    min_detection_confidence=0.3, # 降低置信度阈值，防止硬币稍微挡住就报错
+    min_tracking_confidence=0.3
 )
 
 @app.get("/")
@@ -36,7 +36,7 @@ async def scan_nails(file: UploadFile = File(...)):
         if img is None:
             return {"success": False, "message": "Photo invalide ou floue."}
 
-        # 1. 灰度化与硬币检测
+        # 1. 硬币轮廓检测
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (9, 9), 2)
         
@@ -44,40 +44,38 @@ async def scan_nails(file: UploadFile = File(...)):
             blurred, 
             cv2.HOUGH_GRADIENT, 
             dp=1.2, 
-            minDist=100, 
-            param1=100, 
-            param2=30, 
-            minRadius=25, 
-            maxRadius=300
+            minDist=80, 
+            param1=80, 
+            param2=25, 
+            minRadius=20, 
+            maxRadius=350
         )
 
         if circles is None:
             return {
                 "success": False, 
-                "message": "Pièce de monnaie non détectée. Posez une pièce de 2€/1€ à côté des doigts."
+                "message": "Pièce non détectée ! Posez la pièce DE CÔTÉ sur la table (ne la posez pas sur vos doigts)."
             }
 
         circles = np.uint16(np.around(circles))
         coin_px_radius = circles[0][0][2]
         coin_px_diameter = coin_px_radius * 2
+        mm_per_px = 25.75 / coin_px_diameter # 2 Euro 标尺
 
-        # 2€ 硬币 25.75mm 标尺
-        mm_per_px = 25.75 / coin_px_diameter
-
-        # 2. AI 手部关键点识别
+        # 2. AI 手部 4 指识别
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
         if not results.multi_hand_landmarks:
             return {
                 "success": False, 
-                "message": "Main non détectée. Veuillez poser vos 4 doigts bien à plat."
+                "message": "Main non détectée. Posez vos 4 doigts bien à plat sans couvrir les articulations avec la pièce."
             }
 
         h, w, _ = img.shape
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        # 算各手指宽度（含 C-Curve 1.07 弧度校正）
+        # C-Curve 弧度 1.07x
         c_curve = 1.07
         index_w_px = abs(landmarks[8].x - landmarks[6].x) * w
         middle_w_px = abs(landmarks[12].x - landmarks[10].x) * w
@@ -99,4 +97,4 @@ async def scan_nails(file: UploadFile = File(...)):
             }
         }
     except Exception as e:
-        return {"success": False, "message": "Erreur d'analyse. Veillez à utiliser une photo claire sur ongles nus."}
+        return {"success": False, "message": "Erreur d'analyse. Merci d'utiliser une photo claire sur ongles nus."}
