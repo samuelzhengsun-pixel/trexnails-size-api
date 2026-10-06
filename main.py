@@ -13,7 +13,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 欧元物理尺寸字典 (mm)
 COIN_SIZES_MM = {
     "2e": 25.75,
     "1e": 23.25,
@@ -27,7 +26,7 @@ def home():
 @app.post("/api/scan-nails")
 async def scan_nails(
     file: UploadFile = File(...),
-    coin_type: str = Form("2e") # 接收前端选中的硬币类型
+    coin_type: str = Form("2e")
 ):
     try:
         contents = await file.read()
@@ -37,14 +36,18 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide ou floue."}
 
+        # ⚡ 提速：如图片过大则等比例压缩至 max 1024px 宽，大幅节省传输与 CPU 分析时间
         h, w, _ = img.shape
+        if w > 1024:
+            scale = 1024.0 / w
+            img = cv2.resize(img, (1024, int(h * scale)))
+            h, w, _ = img.shape
 
-        # 1. 获取物理标尺尺寸
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 2. 全局多尺度硬币轮廓扫描 (无论硬币摆在桌面何处)
+        # 1. 硬币轮廓扫描
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 2)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
         circles = cv2.HoughCircles(
             blurred, 
@@ -53,8 +56,8 @@ async def scan_nails(
             minDist=40, 
             param1=60, 
             param2=20, 
-            minRadius=12, 
-            maxRadius=400
+            minRadius=10, 
+            maxRadius=350
         )
 
         if circles is None:
@@ -64,22 +67,18 @@ async def scan_nails(
             }
 
         circles = np.uint16(np.around(circles))
-        
-        # 寻找图像中最可能是硬币的圆形（按显著性与正圆度过滤）
         best_coin = circles[0][0]
         coin_px_diameter = best_coin[2] * 2
 
-        # 计算真实像素-毫米转换率
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 3. 手部区域抗遮挡分割与连通域分析
+        # 2. 肤色分割与抗遮挡分析
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_skin = np.array([0, 15, 60], dtype=np.uint8)
         upper_skin = np.array([25, 255, 255], dtype=np.uint8)
         mask = cv2.inRange(hsv, lower_skin, upper_skin)
 
-        # 闭运算填充小面积遮挡（如部分硬币盖住的区域）
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -99,18 +98,18 @@ async def scan_nails(
                 "message": "Main non détectée. Posez vos 4 doigts bien à plat."
             }
 
-        # 4. 解剖学几何透视 & C-Curve 弧度（1.07x）精准解算 4 指宽度
-        c_curve = 1.07
+        # 📏 解决数据偏大问题：精确缩减物理比例 + 精细 C-Curve (1.03)
+        c_curve = 1.03
         
-        index_w_px = hand_w_px * 0.225
-        middle_w_px = hand_w_px * 0.245
-        ring_w_px = hand_w_px * 0.215
-        pinky_w_px = hand_w_px * 0.170
+        index_w_px = hand_w_px * 0.205  # 微调原 0.225 -> 0.205
+        middle_w_px = hand_w_px * 0.225 # 微调原 0.245 -> 0.225
+        ring_w_px = hand_w_px * 0.195   # 微调原 0.215 -> 0.195
+        pinky_w_px = hand_w_px * 0.155  # 微调原 0.170 -> 0.155
 
-        index_mm = max(9.0, min(15.0, index_w_px * mm_per_px * c_curve))
-        middle_mm = max(9.0, min(15.0, middle_w_px * mm_per_px * c_curve))
-        ring_mm = max(9.0, min(15.0, ring_w_px * mm_per_px * c_curve))
-        pinky_mm = max(7.0, min(13.0, pinky_w_px * mm_per_px * c_curve))
+        index_mm = max(8.5, min(14.5, index_w_px * mm_per_px * c_curve))
+        middle_mm = max(8.5, min(14.5, middle_w_px * mm_per_px * c_curve))
+        ring_mm = max(8.5, min(14.5, ring_w_px * mm_per_px * c_curve))
+        pinky_mm = max(6.5, min(12.5, pinky_w_px * mm_per_px * c_curve))
 
         return {
             "success": True,
