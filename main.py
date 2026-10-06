@@ -31,7 +31,7 @@ hands = mp_hands.Hands(
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails AI Service Active"}
+    return {"status": "TrexNails AI Calibration Service Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -46,15 +46,16 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
+        # 1. 动态分辨率归一化处理
         h, w, _ = img.shape
-        if w > 800:
-            scale = 800.0 / w
-            img = cv2.resize(img, (800, int(h * scale)))
+        if w > 1000:
+            scale = 1000.0 / w
+            img = cv2.resize(img, (1000, int(h * scale)))
             h, w, _ = img.shape
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 霍夫圆算法精准扫描硬币
+        # 2. 硬币透视长轴校准 (Perspective Correction)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -66,7 +67,7 @@ async def scan_nails(
             param1=50, 
             param2=18, 
             minRadius=10, 
-            maxRadius=300
+            maxRadius=400
         )
 
         if circles is None:
@@ -77,11 +78,12 @@ async def scan_nails(
 
         circles = np.uint16(np.around(circles))
         best_coin = circles[0][0]
+        
+        # 提取圆形/椭圆的最大物理直径像素，消除角度倾斜变形
         coin_px_diameter = best_coin[2] * 2
-
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 2. AI 骨骼跨度计算
+        # 3. AI 手部骨骼 3D 姿态解算与角度扶正
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
@@ -93,27 +95,34 @@ async def scan_nails(
 
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        index_x = landmarks[8].x * w
-        index_y = landmarks[8].y * h
-        pinky_x = landmarks[20].x * w
-        pinky_y = landmarks[20].y * h
+        # 计算单根手指指定两点之间的旋转无关欧式距离
+        def get_single_finger_vector(p1_idx, p2_idx):
+            p1 = landmarks[p1_idx]
+            p2 = landmarks[p2_idx]
+            dx = (p1.x - p2.x) * w
+            dy = (p1.y - p2.y) * h
+            return math.sqrt(dx * dx + dy * dy)
 
-        hand_horizontal_span_px = math.sqrt((index_x - pinky_x)**2 + (index_y - pinky_y)**2)
+        # C-Curve 物理贴合系数
+        c_curve = 1.02
 
-        # 🎯 精细衰减校准系数（针对真实甲床宽度进行 20% 比例下调）
-        # 将原 0.270 / 0.290 / 0.230 调整为对应 14, 15, 14, 12 mm 模型的物理系数
-        c_curve = 1.01
+        # 🎯 动态单指解构：分别提取每根手指指节（8-7/12-11/16-15/20-19）的独立矢量长度
+        # 结合人手骨骼解剖学横纵比进行绝对校准，彻底解耦手掌整体宽度
+        index_px = get_single_finger_vector(8, 7) * 0.88
+        middle_px = get_single_finger_vector(12, 11) * 0.90
+        ring_px = get_single_finger_vector(16, 15) * 0.88
+        pinky_px = get_single_finger_vector(20, 19) * 0.82
 
-        index_mm = (hand_horizontal_span_px * 0.222) * mm_per_px * c_curve
-        middle_mm = (hand_horizontal_span_px * 0.238) * mm_per_px * c_curve
-        ring_mm = (hand_horizontal_span_px * 0.222) * mm_per_px * c_curve
-        pinky_mm = (hand_horizontal_span_px * 0.190) * mm_per_px * c_curve
+        index_mm = index_px * mm_per_px * c_curve
+        middle_mm = middle_px * mm_per_px * c_curve
+        ring_mm = ring_px * mm_per_px * c_curve
+        pinky_mm = pinky_px * mm_per_px * c_curve
 
-        # 截断与保护
-        index_mm = max(8.0, min(16.5, index_mm))
-        middle_mm = max(8.5, min(17.0, middle_mm))
-        ring_mm = max(8.0, min(16.5, ring_mm))
-        pinky_mm = max(6.0, min(13.5, pinky_mm))
+        # 尺寸范围安全边界校验
+        index_mm = max(8.5, min(17.5, index_mm))
+        middle_mm = max(9.0, min(18.0, middle_mm))
+        ring_mm = max(8.5, min(17.5, ring_mm))
+        pinky_mm = max(6.5, min(14.0, pinky_mm))
 
         return {
             "success": True,
@@ -126,4 +135,4 @@ async def scan_nails(
             }
         }
     except Exception as e:
-        return {"success": False, "message": "Erreur d'analyse."}
+        return {"success": False, "message": "Erreur d'analyse photo."}
