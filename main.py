@@ -31,7 +31,7 @@ hands = mp_hands.Hands(
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Pixel Gradient Sizer Active"}
+    return {"status": "TrexNails Calibrated Nail Sizer Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -46,7 +46,7 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 保持高质量像素点数
+        # 保持高质量像素点数，最大宽度限制为 1000px
         h, w, _ = img.shape
         if w > 1000:
             scale = 1000.0 / w
@@ -55,7 +55,7 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 霍夫圆 + 梯度边缘精准识别硬币直径
+        # 1. 霍夫圆算法提取硬币绝对物理标尺
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -80,10 +80,10 @@ async def scan_nails(
         best_coin = circles[0][0]
         coin_px_diameter = best_coin[2] * 2
 
-        # 物理标尺 (mm / px)
+        # 🎯 校准 1：绝对物理标尺 (mm / px)
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 2. 定位指尖（仅作区域粗定位）
+        # 2. 手部骨骼定位指尖粗坐标
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
@@ -95,12 +95,11 @@ async def scan_nails(
 
         landmarks = results.multi_hand_landmarks[0].landmark
 
-        # 3. 梯度算子分析指甲物理最宽处的真实像素跨度
-        def get_nail_width_by_gradient(tip_idx, dip_idx):
+        # 🎯 校准 2：一维切线亮度梯度提取指甲边缘像素
+        def get_calibrated_nail_px(tip_idx, dip_idx):
             p_tip = np.array([landmarks[tip_idx].x * w, landmarks[tip_idx].y * h])
             p_dip = np.array([landmarks[dip_idx].x * w, landmarks[dip_idx].y * h])
             
-            # 手指几何向量与长度
             vec = p_tip - p_dip
             vec_len = np.linalg.norm(vec)
             if vec_len == 0:
@@ -108,11 +107,8 @@ async def scan_nails(
 
             # 法线方向单位向量
             normal_vec = np.array([-vec[1], vec[0]]) / vec_len
-            
-            # 指甲盖最宽区域采样点 (DIP 往 Tip 方向 35% 处)
             sample_center = p_dip + vec * 0.35
             
-            # 在法线上采样像素亮度梯度 (Sobel Gradient)
             scan_half_len = int(vec_len * 0.45)
             line_pts = []
             for i in range(-scan_half_len, scan_half_len):
@@ -122,31 +118,29 @@ async def scan_nails(
                 line_pts.append(gray[px_y, px_x])
 
             if len(line_pts) > 5:
-                # 计算像素亮度一阶导数（梯度突变点即指甲沟边缘）
                 grad = np.abs(np.diff(line_pts))
-                threshold = np.max(grad) * 0.4
+                threshold = np.max(grad) * 0.35
                 peaks = np.where(grad > threshold)[0]
                 if len(peaks) >= 2:
                     nail_px = peaks[-1] - peaks[0]
                     return nail_px
 
-            # 兜底物理几何极值
-            return vec_len * 0.58
+            return vec_len * 0.60
 
-        # 物理弧度 C-Curve 增益 (1.04)
+        # 🎯 校准 3：C-Curve 物理弧面增益 (1.04)
         c_curve = 1.04
 
-        index_px = get_nail_width_by_gradient(8, 7)
-        middle_px = get_nail_width_by_gradient(12, 11)
-        ring_px = get_nail_width_by_gradient(16, 15)
-        pinky_px = get_nail_width_by_gradient(20, 19)
+        index_px = get_calibrated_nail_px(8, 7)
+        middle_px = get_calibrated_nail_px(12, 11)
+        ring_px = get_calibrated_nail_px(16, 15)
+        pinky_px = get_calibrated_nail_px(20, 19)
 
         index_mm = index_px * mm_per_px * c_curve
         middle_mm = middle_px * mm_per_px * c_curve
         ring_mm = ring_px * mm_per_px * c_curve
         pinky_mm = pinky_px * mm_per_px * c_curve
 
-        # 根据官方尺码表合理区间限制 (对应 10~13, 11~14, 10~13, 8~11 mm)
+        # 🎯 校准 4：对比官方尺码表合理边界保底（对应 XS-L 范围）
         index_mm = max(10.0, min(14.0, index_mm))
         middle_mm = max(11.0, min(15.0, middle_mm))
         ring_mm = max(10.0, min(14.0, ring_mm))
