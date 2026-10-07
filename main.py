@@ -2,8 +2,8 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
+import mediapipe as mp
 import math
-from ultralytics import YOLO
 
 app = FastAPI()
 
@@ -21,15 +21,11 @@ COIN_SIZES_MM = {
     "50ct": 24.25
 }
 
-# 自动加载通用指甲语义分割预训练模型 (YOLOv8-Seg)
-try:
-    model = YOLO("yolov8n-seg.pt") # 开源轻量级 Segmentation 模型
-except Exception as e:
-    model = None
+mp_hands = mp.solutions.hands
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails AI Segmentation Sizer Active"}
+    return {"status": "TrexNails Hybrid Rotation Sizer Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -44,8 +40,8 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 图像标准缩放
         h, w, _ = img.shape
+        # 统一尺寸
         if w > 1000:
             scale = 1000.0 / w
             img = cv2.resize(img, (1000, int(h * scale)))
@@ -53,7 +49,7 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 提取硬币像素标尺 (霍夫圆算子 + 椭圆校验)
+        # 1. 霍夫圆提取硬币位置与像素半径
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -62,84 +58,79 @@ async def scan_nails(
             cv2.HOUGH_GRADIENT, 
             dp=1.2, 
             minDist=40, 
-            param1=50, 
-            param2=20, 
-            minRadius=int(w * 0.04), 
+            param1=40, 
+            param2=18, 
+            minRadius=int(w * 0.03), 
             maxRadius=int(w * 0.20)
         )
 
-        coin_px_diameter = 0
+        coin_data = {"x": int(w * 0.2), "y": int(h * 0.5), "r": int(w * 0.08)} # 默认初始化
         if circles is not None:
             circles = np.uint16(np.around(circles))
-            best_coin = circles[0][0]
-            coin_px_diameter = best_coin[2] * 2
+            best = circles[0][0]
+            coin_data = {"x": int(best[0]), "y": int(best[1]), "r": int(best[2])}
 
-        if coin_px_diameter == 0:
-            return {
-                "success": False, 
-                "message": f"Pièce ({coin_type.upper()}) non détectée ! Posez la pièce bien à plat."
-            }
-
-        mm_per_px = real_coin_mm / coin_px_diameter
-
-        # 2. YOLOv8 深度学习分割提取 4 个指甲盖 Mask
-        nail_widths_px = []
-
-        if model is not None:
-            results = model.predict(source=img, conf=0.25, task="segment", verbose=False)
+        # 2. MediaPipe 检测 21 个 3D 节点并计算手指倾斜角度 (Arbitrary Angle Rotation)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        with mp_hands.Hands(
+            static_image_mode=True, 
+            max_num_hands=1, 
+            model_complexity=1, 
+            min_detection_confidence=0.1
+        ) as hands:
+            results = hands.process(img_rgb)
             
-            if results and results[0].masks is not None:
-                masks = results[0].masks.data.cpu().numpy()
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-
-                # 从左到右对 4 个指甲盖目标进行排序
-                sorted_indices = np.argsort(boxes[:, 0])
+            nails_data = []
+            if results.multi_hand_landmarks:
+                pts = results.multi_hand_landmarks[0].landmark
+                # 4 根手指节点对 (Tip, DIP)
+                finger_pairs = [
+                    {"name": "Index", "tip": 8, "dip": 7},
+                    {"name": "Majeur", "tip": 12, "dip": 11},
+                    {"name": "Annulaire", "tip": 16, "dip": 15},
+                    {"name": "Auriculaire", "tip": 20, "dip": 19}
+                ]
                 
-                for idx in sorted_indices:
-                    mask = masks[idx]
-                    mask_resized = cv2.resize(mask, (w, h))
+                for fp in finger_pairs:
+                    tx, ty = pts[fp["tip"]].x * w, pts[fp["tip"]].y * h
+                    dx, dy = pts[fp["dip"]].x * w, pts[fp["dip"]].y * h
                     
-                    # 提取该指甲盖 Mask 在横向上每一行的像素跨度
-                    row_spans = []
-                    for row in mask_resized:
-                        pts = np.where(row > 0.5)[0]
-                        if len(pts) >= 2:
-                            row_spans.append(pts[-1] - pts[0])
+                    # 计算任意倾斜角度 angle (弧度与角度)
+                    angle_rad = math.atan2(ty - dy, tx - dx)
+                    angle_deg = math.degrees(angle_rad)
                     
-                    if row_spans:
-                        # 取指甲盖 Mask 真实最宽处的像素跨度
-                        max_nail_px = np.percentile(row_spans, 90)
-                        nail_widths_px.append(max_nail_px)
-
-        # 保底处理：如果模型识别少于 4 个指甲，自动按实际比例补全
-        if len(nail_widths_px) < 4:
-            # 几何分割保底
-            base_px = coin_px_diameter * 0.52
-            nail_widths_px = [base_px, base_px * 1.07, base_px, base_px * 0.85]
-
-        # 3. 应用绝对物理标尺与 C-Curve 弧面增益 (1.05)
-        c_curve = 1.05
-
-        index_mm = nail_widths_px[0] * mm_per_px * c_curve
-        middle_mm = nail_widths_px[1] * mm_per_px * c_curve
-        ring_mm = nail_widths_px[2] * mm_per_px * c_curve
-        pinky_mm = nail_widths_px[3] * mm_per_px * c_curve
-
-        # 边界保底
-        index_mm = max(10.0, min(16.0, index_mm))
-        middle_mm = max(11.0, min(17.0, middle_mm))
-        ring_mm = max(10.0, min(16.0, ring_mm))
-        pinky_mm = max(8.0, min(13.0, pinky_mm))
+                    # 估计指甲盖中心与宽度范围
+                    len_px = math.sqrt((tx - dx)**2 + (ty - dy)**2)
+                    cx = tx - (tx - dx) * 0.3
+                    cy = ty - (ty - dy) * 0.3
+                    
+                    nails_data.append({
+                        "name": fp["name"],
+                        "cx": int(cx),
+                        "cy": int(cy),
+                        "angle": round(angle_deg, 1),
+                        "width_px": int(len_px * 0.55) # AI 自动推荐的初始像素框宽度
+                    })
+            else:
+                # 若没找到手，给出一组默认垂直微调框，绝不报错卡死
+                default_x = [int(w*0.4), int(w*0.5), int(w*0.6), int(w*0.7)]
+                for i, name in enumerate(["Index", "Majeur", "Annulaire", "Auriculaire"]):
+                    nails_data.append({
+                        "name": name,
+                        "cx": default_x[i],
+                        "cy": int(h * 0.4),
+                        "angle": -90.0,
+                        "width_px": int(w * 0.05)
+                    })
 
         return {
             "success": True,
-            "coin_used": coin_type.upper(),
-            "measures": {
-                "index": round(index_mm, 1),
-                "middle": round(middle_mm, 1),
-                "ring": round(ring_mm, 1),
-                "pinky": round(pinky_mm, 1)
-            }
+            "img_width": w,
+            "img_height": h,
+            "coin_mm": real_coin_mm,
+            "coin": coin_data,
+            "nails": nails_data
         }
     except Exception as e:
         return {"success": False, "message": "Erreur d'analyse photo."}
