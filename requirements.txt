@@ -4,4 +4,3 @@ python-multipart
 opencv-python-headless
 numpy
 mediapipe
-ultralytics
