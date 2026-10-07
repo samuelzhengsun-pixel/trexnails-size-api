@@ -14,16 +14,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 严格遵循欧盟官方硬币物理直径 (绝不颠倒)
+# 严格官方欧元物理直径 (mm)
 COIN_SIZES_MM = {
-    "2e": 25.75,    # 2€ 25.75mm
-    "50ct": 24.25,  # 50ct 24.25mm
-    "1e": 23.25     # 1€ 23.25mm
+    "2e": 25.75,
+    "50ct": 24.25,
+    "1e": 23.25
 }
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Strict Physical Calibration Engine Active"}
+    return {"status": "TrexNails Mask-Filtered Precision Engine Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -38,14 +38,12 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 1. 严格清洗 coin_type，确保 1e, 50ct, 2e 准确映射物理毫米数
+        # 1. 参数强洗与图像归一化 (宽 1000px)
         coin_key = str(coin_type).strip().lower()
         if coin_key not in COIN_SIZES_MM:
             coin_key = "2e"
-            
         real_coin_mm = COIN_SIZES_MM[coin_key]
 
-        # 2. 图像标准化缩放 (宽 1000px)
         h_orig, w_orig, _ = img.shape
         target_w = 1000
         scale = target_w / float(w_orig)
@@ -55,16 +53,31 @@ async def scan_nails(
         img_center_x, img_center_y = w_s / 2.0, h_s / 2.0
         max_dist_to_center = math.sqrt(img_center_x**2 + img_center_y**2)
 
-        # 3. 硬币标尺检测 (椭圆拟合长轴)
+        # ==========================================================
+        # 🎯 方案 1 核心：背景杂波过滤引擎 (硬币与手部双重强掩模)
+        # ==========================================================
+        hsv = cv2.cvtColor(img_s, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(img_s, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        # A. 提取硬币金属色范围 (过滤黑缝/白键/背景杂波)
+        lower_metal1 = np.array([10, 30, 60], dtype=np.uint8)
+        upper_metal1 = np.array([38, 255, 255], dtype=np.uint8)
+        mask_metal = cv2.inRange(hsv, lower_metal1, upper_metal1)
         
+        # 将金属掩模进行平滑闭运算
+        kernel_coin = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask_metal = cv2.morphologyEx(mask_metal, cv2.MORPH_CLOSE, kernel_coin)
+
+        # 在纯净的金属掩模图像上检测硬币，不受键盘按键干扰
+        coin_masked_gray = cv2.bitwise_and(gray, gray, mask=mask_metal)
+        blurred_coin = cv2.GaussianBlur(coin_masked_gray, (7, 7), 0)
+
         coin_px_diameter = 0
-        edges = cv2.Canny(blurred, 30, 100)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        edges_coin = cv2.Canny(blurred_coin, 30, 100)
+        contours_coin, _ = cv2.findContours(edges_coin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         max_valid_d = 0
-        for c in contours:
+        for c in contours_coin:
             area = cv2.contourArea(c)
             if (w_s * h_s * 0.003) < area < (w_s * h_s * 0.15):
                 if len(c) >= 5:
@@ -79,9 +92,11 @@ async def scan_nails(
         if max_valid_d > 0:
             coin_px_diameter = max_valid_d
         else:
+            # 降级备用：在原图的高斯模糊上寻找
+            blurred_orig = cv2.GaussianBlur(gray, (7, 7), 0)
             for param2 in [25, 20, 15]:
                 circles = cv2.HoughCircles(
-                    blurred, 
+                    blurred_orig, 
                     cv2.HOUGH_GRADIENT, 
                     dp=1.2, 
                     minDist=50, 
@@ -102,20 +117,19 @@ async def scan_nails(
                 "message": f"Pièce ({coin_key.upper()}) non détectée. Assurez-vous qu'elle soit bien visible."
             }
 
-        # 物理像素比例尺 (绝对遵循 real_coin_mm / coin_px_diameter)
         mm_per_px = real_coin_mm / float(coin_px_diameter)
 
-        # 4. 手部 Mask 提取与采样
-        hsv = cv2.cvtColor(img_s, cv2.COLOR_BGR2HSV)
+        # B. 提取手部肤色掩模并平滑键盘按键缝隙
         lower_skin = np.array([0, 15, 30], dtype=np.uint8)
         upper_skin = np.array([28, 255, 255], dtype=np.uint8)
         skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+        # 使用更大核的闭运算，抹平指腹落在键盘缝隙上的阴影陷阱
+        kernel_hand = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel_hand)
 
-        contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_contours = [c for c in contours if cv2.contourArea(c) > (w_s * h_s * 0.04)]
+        contours_hand, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_contours = [c for c in contours_hand if cv2.contourArea(c) > (w_s * h_s * 0.04)]
 
         if not valid_contours:
             return {"success": False, "message": "Main non détectée. Posez vos doigts sur un fond clair."}
@@ -123,6 +137,7 @@ async def scan_nails(
         hand_contour = max(valid_contours, key=cv2.contourArea)
         hx, hy, hw, hh = cv2.boundingRect(hand_contour)
 
+        # 2. 横截面多层采样
         roi_y1 = hy + int(hh * 0.12)
         roi_y2 = hy + int(hh * 0.35)
         
@@ -163,7 +178,7 @@ async def scan_nails(
             avg_cx = [hx + hw * 0.2, hx + hw * 0.4, hx + hw * 0.6, hx + hw * 0.8]
             avg_cy = [hy + hh * 0.2, hy + hh * 0.15, hy + hh * 0.2, hy + hh * 0.28]
 
-        # 5. 保持完全不变的精化解剖锚定计算 (保持小拇指与前三指的精准比例)
+        # 3. 小拇指解剖补偿锚定与自适应计算
         pinky_y = avg_cy[3]
         pinky_x = avg_cx[3]
         
