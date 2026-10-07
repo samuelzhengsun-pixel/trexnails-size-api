@@ -22,7 +22,7 @@ COIN_SIZES_MM = {
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Spatial Weighted Engine Active"}
+    return {"status": "TrexNails Anchored Normalized Engine Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -44,7 +44,6 @@ async def scan_nails(
         img_s = cv2.resize(img, (target_w, int(h_orig * scale)))
         h_s, w_s, _ = img_s.shape
         
-        # 图像中心点坐标
         img_center_x, img_center_y = w_s / 2.0, h_s / 2.0
         max_dist_to_center = math.sqrt(img_center_x**2 + img_center_y**2)
 
@@ -99,7 +98,7 @@ async def scan_nails(
 
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 3. 手部连通域提取
+        # 3. 手部 Mask 提取
         hsv = cv2.cvtColor(img_s, cv2.COLOR_BGR2HSV)
         lower_skin = np.array([0, 15, 30], dtype=np.uint8)
         upper_skin = np.array([28, 255, 255], dtype=np.uint8)
@@ -117,16 +116,13 @@ async def scan_nails(
         hand_contour = max(valid_contours, key=cv2.contourArea)
         hx, hy, hw, hh = cv2.boundingRect(hand_contour)
 
-        # 4. 手指横截面多层动态扫描
+        # 4. 手指横截面多层动态采样
         roi_y1 = hy + int(hh * 0.12)
         roi_y2 = hy + int(hh * 0.35)
         
         finger_raw_widths = []
         finger_centers_x = []
         finger_centers_y = []
-
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobelx = np.abs(sobelx)
 
         for scan_y in range(roi_y1, roi_y2, max(1, (roi_y2 - roi_y1) // 10)):
             row_skin = skin_mask[scan_y, hx:hx+hw]
@@ -161,10 +157,13 @@ async def scan_nails(
             avg_cx = [hx + hw * 0.2, hx + hw * 0.4, hx + hw * 0.6, hx + hw * 0.8]
             avg_cy = [hy + hh * 0.2, hy + hh * 0.15, hy + hh * 0.2, hy + hh * 0.28]
 
-        # 🎯 5. 基于图像空间坐标的逻辑化自适应加权计算 (Spatial Adaptivity)
-        y_min = min(avg_cy)
-        y_max = max(avg_cy)
-        y_span = max(1.0, y_max - y_min)
+        # 🎯 5. 小拇指基准锚定法 (Pinky-Anchored Relative Scaling)
+        # 以小拇指的 Y 坐标作为最远深度基准点 (Pinky Baseline = 0.0)
+        pinky_y = avg_cy[3]
+        pinky_x = avg_cx[3]
+        
+        base_nail_ratio = 0.58
+        c_curve = 0.95
 
         calibrated_mm_list = []
 
@@ -172,23 +171,23 @@ async def scan_nails(
             raw_w_px = avg_widths[i]
             fx, fy = avg_cx[i], avg_cy[i]
 
-            # A. 镜头中心场偏离权值 (距图片中心越近，凸透镜放大倍数越高，做适度比例收缩)
-            dist_to_center = math.sqrt((fx - img_center_x)**2 + (fy - img_center_y)**2)
-            center_factor = dist_to_center / max_dist_to_center
-            # 权重范围: 位于中心时为 0.935，位于极端边缘时为 0.995
-            w_optical = 0.935 + (center_factor * 0.06)
+            if i == 3:
+                # 📌 小拇指：作为绝对物理基准锚点，乘数固定为 1.00，不再受透视衰减
+                w_rel = 1.00
+            else:
+                # 食指、中指、无名指：计算相对于小拇指的纵向高度差与中心近场差
+                y_diff = max(0.0, pinky_y - fy)
+                rel_height_ratio = y_diff / max(1.0, hh * 0.25)
+                
+                dist_to_center = math.sqrt((fx - img_center_x)**2 + (fy - img_center_y)**2)
+                pinky_dist_to_center = math.sqrt((pinky_x - img_center_x)**2 + (pinky_y - img_center_y)**2)
+                rel_center_ratio = max(0.0, (pinky_dist_to_center - dist_to_center) / max_dist_to_center)
 
-            # B. 纵向几何深度权值 (Y 坐标越小说明手指尖越靠上，距离镜头垂直深度越近)
-            depth_ratio = (fy - y_min) / y_span  # 范围 0.0 (最顶端) 到 1.0 (最底端)
-            # 顶端手指自适应乘以 0.94，底端手指乘以 0.99
-            w_depth = 0.94 + (depth_ratio * 0.05)
+                # 相对补偿因子：高度越高于小拇指、越靠近镜头中心，按 0.92 ~ 0.95 动态衰减
+                w_rel = 1.0 - (rel_height_ratio * 0.05) - (rel_center_ratio * 0.03)
+                w_rel = max(0.91, min(1.0, w_rel))
 
-            # C. 基础生物肉甲比率 (0.58) 与 C-Curve 弧度 (0.95)
-            base_nail_ratio = 0.58
-            c_curve = 0.95
-
-            # 综合动态校准算法 (完全弃用固定减法，纯几何权重相乘)
-            final_mm = raw_w_px * base_nail_ratio * mm_per_px * c_curve * w_optical * w_depth
+            final_mm = raw_w_px * base_nail_ratio * mm_per_px * c_curve * w_rel
             calibrated_mm_list.append(final_mm)
 
         index_mm  = max(8.5, min(15.0, calibrated_mm_list[0]))
