@@ -21,7 +21,7 @@ COIN_SIZES_MM = {
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Real-Scale Fix Active"}
+    return {"status": "TrexNails Contour Protection Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -36,6 +36,7 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
+        # 1. 统一调整图像宽度至 1000px
         h, w, _ = img.shape
         if w > 1000:
             scale = 1000.0 / w
@@ -44,7 +45,7 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 1. 抓取硬币像素标尺
+        # 2. 硬币精确抓取 (增加严格面积与圆度校验，剔除桌影噪点)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
@@ -52,52 +53,66 @@ async def scan_nails(
             blurred, 
             cv2.HOUGH_GRADIENT, 
             dp=1.2, 
-            minDist=40, 
-            param1=40, 
-            param2=18, 
-            minRadius=int(w * 0.03),
-            maxRadius=int(w * 0.25)
+            minDist=50, 
+            param1=50, 
+            param2=22, 
+            minRadius=int(w * 0.05),
+            maxRadius=int(w * 0.20)
         )
 
         coin_px_diameter = 0
         if circles is not None:
             circles = np.uint16(np.around(circles))
-            coin_px_diameter = circles[0][0][2] * 2
+            best_coin = circles[0][0]
+            coin_px_diameter = best_coin[2] * 2
         else:
-            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 轮廓校验拟合
+            edges = cv2.Canny(blurred, 30, 100)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            max_area = 0
             for c in contours:
                 area = cv2.contourArea(c)
-                if (w * h * 0.005) < area < (w * h * 0.1):
+                if (w * h * 0.01) < area < (w * h * 0.15):
                     (cx, cy), (d1, d2), _ = cv2.fitEllipse(c)
-                    if min(d1, d2) / max(d1, d2) > 0.65:
+                    if min(d1, d2) / max(d1, d2) > 0.7 and area > max_area:
+                        max_area = area
                         coin_px_diameter = max(d1, d2)
-                        break
 
         if coin_px_diameter == 0:
             return {
                 "success": False, 
-                "message": f"Pièce ({coin_type.upper()}) non détectée. Posez la pièce bien à plat à côté des doigts."
+                "message": f"Pièce ({coin_type.upper()}) non détectée. Posez la pièce bien à plat à côté de vos doigts."
             }
 
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 2. HSV 肤色分割提取手指
+        # 3. HSV 肤色提取与连通域修复 (形态学闭运算消除碎片噪点)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_skin = np.array([0, 10, 30], dtype=np.uint8)
-        upper_skin = np.array([30, 255, 255], dtype=np.uint8)
+        lower_skin = np.array([0, 12, 35], dtype=np.uint8)
+        upper_skin = np.array([28, 255, 255], dtype=np.uint8)
         
         skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
-        skin_mask = cv2.medianBlur(skin_mask, 5)
+        
+        # 核心修复：连通域膨胀与闭运算，填补裂缝
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
 
+        # 过滤面积过小的杂质噪点，确保只识别整块手部
         contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return {"success": False, "message": "Main non détectée."}
+        valid_contours = [c for c in contours if cv2.contourArea(c) > (w * h * 0.05)]
 
-        hand_contour = max(contours, key=cv2.contourArea)
+        if not valid_contours:
+            return {"success": False, "message": "Main non détectée. Veillez à poser vos doigts sur un fond clair."}
+
+        hand_contour = max(valid_contours, key=cv2.contourArea)
         x, y, hand_w, hand_h = cv2.boundingRect(hand_contour)
 
-        # 3. 横向指甲采样
+        # 校验手部物理有效跨度（防止抓取到非手部大面积背景）
+        if hand_w < (w * 0.15) or hand_h < (h * 0.15):
+            return {"success": False, "message": "Main non détectée correctement. Veuillez reprendre la photo."}
+
+        # 4. 横向指甲最宽处像素采样
         roi_y1 = y + int(hand_h * 0.08)
         roi_y2 = y + int(hand_h * 0.35)
         
@@ -114,7 +129,7 @@ async def scan_nails(
                     valid_ends = ends[ends > s]
                     if len(valid_ends) > 0:
                         w_px = valid_ends[0] - s
-                        if 15 < w_px < (hand_w * 0.38):
+                        if (hand_w * 0.10) < w_px < (hand_w * 0.38):
                             widths.append(w_px)
             if len(widths) >= 4:
                 finger_widths_px.append(widths[:4])
@@ -131,8 +146,8 @@ async def scan_nails(
             ring_px = avg_widths[2]
             pinky_px = avg_widths[3]
 
-        # 🎯 物理真实校准：将解剖系数调至 0.84，物理倍率精准对齐 14, 15, 14, 12 mm
-        nail_to_finger_ratio = 0.84
+        # 5. 1:1 绝对物理解算映射 (对应标准尺寸 14, 15, 14, 12 mm)
+        nail_to_finger_ratio = 0.75
         c_curve = 1.05
 
         index_mm = index_px * nail_to_finger_ratio * mm_per_px * c_curve
