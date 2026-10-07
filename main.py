@@ -14,15 +14,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 严格遵循欧盟官方硬币物理直径 (绝不颠倒)
 COIN_SIZES_MM = {
-    "2e": 25.75,
-    "1e": 23.25,
-    "50ct": 24.25
+    "2e": 25.75,    # 2€ 25.75mm
+    "50ct": 24.25,  # 50ct 24.25mm
+    "1e": 23.25     # 1€ 23.25mm
 }
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Perfect Precision Engine Active"}
+    return {"status": "TrexNails Strict Physical Calibration Engine Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -37,7 +38,14 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 1. 图像标准化缩放 (宽 1000px)
+        # 1. 严格清洗 coin_type，确保 1e, 50ct, 2e 准确映射物理毫米数
+        coin_key = str(coin_type).strip().lower()
+        if coin_key not in COIN_SIZES_MM:
+            coin_key = "2e"
+            
+        real_coin_mm = COIN_SIZES_MM[coin_key]
+
+        # 2. 图像标准化缩放 (宽 1000px)
         h_orig, w_orig, _ = img.shape
         target_w = 1000
         scale = target_w / float(w_orig)
@@ -47,9 +55,7 @@ async def scan_nails(
         img_center_x, img_center_y = w_s / 2.0, h_s / 2.0
         max_dist_to_center = math.sqrt(img_center_x**2 + img_center_y**2)
 
-        real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
-
-        # 2. 硬币标尺精准检测 (椭圆拟合长轴)
+        # 3. 硬币标尺检测 (椭圆拟合长轴)
         gray = cv2.cvtColor(img_s, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         
@@ -93,12 +99,13 @@ async def scan_nails(
         if coin_px_diameter == 0:
             return {
                 "success": False, 
-                "message": f"Pièce ({coin_type.upper()}) non détectée. Assurez-vous qu'elle soit bien visible."
+                "message": f"Pièce ({coin_key.upper()}) non détectée. Assurez-vous qu'elle soit bien visible."
             }
 
-        mm_per_px = real_coin_mm / coin_px_diameter
+        # 物理像素比例尺 (绝对遵循 real_coin_mm / coin_px_diameter)
+        mm_per_px = real_coin_mm / float(coin_px_diameter)
 
-        # 3. 手部 Mask 提取
+        # 4. 手部 Mask 提取与采样
         hsv = cv2.cvtColor(img_s, cv2.COLOR_BGR2HSV)
         lower_skin = np.array([0, 15, 30], dtype=np.uint8)
         upper_skin = np.array([28, 255, 255], dtype=np.uint8)
@@ -116,7 +123,6 @@ async def scan_nails(
         hand_contour = max(valid_contours, key=cv2.contourArea)
         hx, hy, hw, hh = cv2.boundingRect(hand_contour)
 
-        # 4. 手指横截面多层动态采样
         roi_y1 = hy + int(hh * 0.12)
         roi_y2 = hy + int(hh * 0.35)
         
@@ -157,7 +163,7 @@ async def scan_nails(
             avg_cx = [hx + hw * 0.2, hx + hw * 0.4, hx + hw * 0.6, hx + hw * 0.8]
             avg_cy = [hy + hh * 0.2, hy + hh * 0.15, hy + hh * 0.2, hy + hh * 0.28]
 
-        # 🎯 5. 小拇指解剖补偿锚定法 (Pinky Compensated Baseline)
+        # 5. 保持完全不变的精化解剖锚定计算 (保持小拇指与前三指的精准比例)
         pinky_y = avg_cy[3]
         pinky_x = avg_cx[3]
         
@@ -171,10 +177,8 @@ async def scan_nails(
             fx, fy = avg_cx[i], avg_cy[i]
 
             if i == 3:
-                # 📌 小拇指：精准增加 1.03 结构增益系数，完美补回 0.5mm 边缘坍塌
                 w_rel = 1.03
             else:
-                # 食指、中指、无名指：保持原有的透视与中心场自适应收缩
                 y_diff = max(0.0, pinky_y - fy)
                 rel_height_ratio = y_diff / max(1.0, hh * 0.25)
                 
@@ -195,7 +199,8 @@ async def scan_nails(
 
         return {
             "success": True,
-            "coin_used": coin_type.upper(),
+            "coin_used": coin_key.upper(),
+            "coin_mm": real_coin_mm,
             "measures": {
                 "index": round(index_mm, 1),
                 "middle": round(middle_mm, 1),
