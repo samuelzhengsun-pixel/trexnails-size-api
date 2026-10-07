@@ -21,7 +21,7 @@ COIN_SIZES_MM = {
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Core Precision Engine Active"}
+    return {"status": "TrexNails Calibrated Precision Engine Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -36,7 +36,7 @@ async def scan_nails(
         if img is None:
             return {"success": False, "message": "Photo invalide."}
 
-        # 1. 统一归一化图像大小 (宽 1000px)
+        # 1. 图像标准化缩放 (宽 1000px)
         h_orig, w_orig, _ = img.shape
         target_w = 1000
         scale = target_w / float(w_orig)
@@ -45,53 +45,61 @@ async def scan_nails(
 
         real_coin_mm = COIN_SIZES_MM.get(coin_type, 25.75)
 
-        # 2. 强效硬币识别 (霍夫圆 + 边缘多重拟合)
+        # 2. 硬币形变率校准识别 (Coin Distortion Correction)
         gray = cv2.cvtColor(img_s, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (7, 7), 0)
         
         coin_px_diameter = 0
         
-        # 尝试多组阈值扫描硬币
-        for param2 in [25, 20, 15]:
-            circles = cv2.HoughCircles(
-                blurred, 
-                cv2.HOUGH_GRADIENT, 
-                dp=1.2, 
-                minDist=50, 
-                param1=50, 
-                param2=param2, 
-                minRadius=int(w_s * 0.03), 
-                maxRadius=int(w_s * 0.18)
-            )
-            if circles is not None:
-                circles = np.uint16(np.around(circles))
-                best_c = circles[0][0]
-                coin_px_diameter = best_c[2] * 2
-                break
+        # 优先寻找椭圆/倾斜形变轮廓，取最大外接长轴计算绝对像素标尺
+        edges = cv2.Canny(blurred, 30, 100)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        max_valid_d = 0
+        for c in contours:
+            area = cv2.contourArea(c)
+            if (w_s * h_s * 0.003) < area < (w_s * h_s * 0.15):
+                if len(c) >= 5:
+                    (cx, cy), (d1, d2), angle = cv2.fitEllipse(c)
+                    major_axis = max(d1, d2)
+                    minor_axis = min(d1, d2)
+                    if minor_axis > 0:
+                        aspect_ratio = minor_axis / major_axis
+                        # 形变率校准：允许倾斜透视形成的椭圆 (形变率 0.6~1.0)
+                        if 0.6 <= aspect_ratio <= 1.0 and major_axis > max_valid_d:
+                            max_valid_d = major_axis
 
-        # 如果霍夫检测漏诊，启动边缘轮廓拟合
-        if coin_px_diameter == 0:
-            edges = cv2.Canny(blurred, 30, 100)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for c in contours:
-                area = cv2.contourArea(c)
-                if (w_s * h_s * 0.005) < area < (w_s * h_s * 0.12):
-                    (cx, cy), (d1, d2), _ = cv2.fitEllipse(c)
-                    if min(d1, d2) > 0 and max(d1, d2) / min(d1, d2) < 1.3:
-                        coin_px_diameter = max(d1, d2)
-                        break
+        if max_valid_d > 0:
+            coin_px_diameter = max_valid_d
+        else:
+            # 降级备用霍夫圆检测
+            for param2 in [25, 20, 15]:
+                circles = cv2.HoughCircles(
+                    blurred, 
+                    cv2.HOUGH_GRADIENT, 
+                    dp=1.2, 
+                    minDist=50, 
+                    param1=50, 
+                    param2=param2, 
+                    minRadius=int(w_s * 0.03), 
+                    maxRadius=int(w_s * 0.18)
+                )
+                if circles is not None:
+                    circles = np.uint16(np.around(circles))
+                    best_c = circles[0][0]
+                    coin_px_diameter = best_c[2] * 2
+                    break
 
-        # 若照片中真没识别到硬币，明确提示客户，绝不乱下结论
         if coin_px_diameter == 0:
             return {
                 "success": False, 
-                "message": f"Pièce ({coin_type.upper()}) non détectée ! Veuillez placer la pièce bien à plat à côté de vos doigts."
+                "message": f"Pièce ({coin_type.upper()}) non détectée. Assurez-vous qu'elle soit bien visible."
             }
 
-        # 计算绝对物理像素比 (mm/px)
+        # 绝对物理像素比 (mm/px)
         mm_per_px = real_coin_mm / coin_px_diameter
 
-        # 3. 手部连通域定位与 4 根手指宽度采样
+        # 3. 手部连通域提取
         hsv = cv2.cvtColor(img_s, cv2.COLOR_BGR2HSV)
         lower_skin = np.array([0, 15, 30], dtype=np.uint8)
         upper_skin = np.array([28, 255, 255], dtype=np.uint8)
@@ -104,13 +112,12 @@ async def scan_nails(
         valid_contours = [c for c in contours if cv2.contourArea(c) > (w_s * h_s * 0.04)]
 
         if not valid_contours:
-            return {"success": False, "message": "Main non détectée. Assurez-vous de poser vos doigts sur un fond clair."}
+            return {"success": False, "message": "Main non détectée. Posez vos doigts sur un fond clair."}
 
         hand_contour = max(valid_contours, key=cv2.contourArea)
         hx, hy, hw, hh = cv2.boundingRect(hand_contour)
 
-        # 4. 横向切面提取 4 根手指盖的真实像素跨度
-        # 在手部上半部分 (top 15% - 35%) 扫描 4 根手指的截面宽度
+        # 4. 手指宽度横向切面采样
         roi_y1 = hy + int(hh * 0.12)
         roi_y2 = hy + int(hh * 0.35)
         
@@ -136,27 +143,27 @@ async def scan_nails(
             avg_widths = np.median(finger_widths_px, axis=0)
             idx_px, mid_px, rng_px, pky_px = avg_widths[0], avg_widths[1], avg_widths[2], avg_widths[3]
         else:
-            # 几何结构保底比例
-            idx_px = hw * 0.18
-            mid_px = hw * 0.20
-            rng_px = hw * 0.18
-            pky_px = hw * 0.14
+            idx_px = hw * 0.16
+            mid_px = hw * 0.18
+            rng_px = hw * 0.16
+            pky_px = hw * 0.12
 
-        # 5. 1:1 物理毫米换算 (加入 1.05 弧面 C-Curve 修正)
-        # 指甲盖占手指宽度的真实物理比率约为 0.78
-        nail_ratio = 0.78
-        c_curve = 1.05
+        # 🎯 5. 精确校准参数调整 (扣除偏大的 3mm 误差)
+        # nail_ratio: 从 0.78 下调至 0.68 (剥离手指两旁肉质干扰)
+        # c_curve: 从 1.05 下调至 0.98 (抵消镜头近大远小的虚高增益)
+        nail_ratio = 0.68
+        c_curve = 0.98
 
         index_mm = idx_px * nail_ratio * mm_per_px * c_curve
         middle_mm = mid_px * nail_ratio * mm_per_px * c_curve
         ring_mm = rng_px * nail_ratio * mm_per_px * c_curve
         pinky_mm = pky_px * nail_ratio * mm_per_px * c_curve
 
-        # 现实物理安全保护 (正常指甲盖毫米数范围: 8mm ~ 18mm)
-        index_mm = max(9.0, min(17.0, index_mm))
-        middle_mm = max(10.0, min(18.0, middle_mm))
-        ring_mm = max(9.0, min(17.0, ring_mm))
-        pinky_mm = max(7.5, min(14.0, pinky_mm))
+        # 物理界限约束
+        index_mm = max(9.0, min(16.0, index_mm))
+        middle_mm = max(10.0, min(17.0, middle_mm))
+        ring_mm = max(9.0, min(16.0, ring_mm))
+        pinky_mm = max(7.5, min(13.0, pinky_mm))
 
         return {
             "success": True,
