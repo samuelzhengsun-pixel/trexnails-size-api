@@ -2,8 +2,14 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
-import mediapipe as mp
 import math
+
+# 兼容性导入 MediaPipe Hands 模块
+import mediapipe as mp
+try:
+    mp_hands = mp.solutions.hands
+except AttributeError:
+    import mediapipe.python.solutions.hands as mp_hands
 
 app = FastAPI()
 
@@ -20,8 +26,6 @@ COIN_SIZES_MM = {
     "1e": 23.25,
     "50ct": 24.25
 }
-
-mp_hands = mp.solutions.hands
 
 @app.get("/")
 def home():
@@ -41,7 +45,6 @@ async def scan_nails(
             return {"success": False, "message": "Photo invalide."}
 
         h, w, _ = img.shape
-        # 统一尺寸
         if w > 1000:
             scale = 1000.0 / w
             img = cv2.resize(img, (1000, int(h * scale)))
@@ -64,13 +67,13 @@ async def scan_nails(
             maxRadius=int(w * 0.20)
         )
 
-        coin_data = {"x": int(w * 0.2), "y": int(h * 0.5), "r": int(w * 0.08)} # 默认初始化
+        coin_data = {"x": int(w * 0.2), "y": int(h * 0.5), "r": int(w * 0.08)}
         if circles is not None:
             circles = np.uint16(np.around(circles))
             best = circles[0][0]
             coin_data = {"x": int(best[0]), "y": int(best[1]), "r": int(best[2])}
 
-        # 2. MediaPipe 检测 21 个 3D 节点并计算手指倾斜角度 (Arbitrary Angle Rotation)
+        # 2. MediaPipe 检测手部节点并计算倾斜角度
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
         with mp_hands.Hands(
@@ -84,7 +87,6 @@ async def scan_nails(
             nails_data = []
             if results.multi_hand_landmarks:
                 pts = results.multi_hand_landmarks[0].landmark
-                # 4 根手指节点对 (Tip, DIP)
                 finger_pairs = [
                     {"name": "Index", "tip": 8, "dip": 7},
                     {"name": "Majeur", "tip": 12, "dip": 11},
@@ -96,11 +98,9 @@ async def scan_nails(
                     tx, ty = pts[fp["tip"]].x * w, pts[fp["tip"]].y * h
                     dx, dy = pts[fp["dip"]].x * w, pts[fp["dip"]].y * h
                     
-                    # 计算任意倾斜角度 angle (弧度与角度)
                     angle_rad = math.atan2(ty - dy, tx - dx)
                     angle_deg = math.degrees(angle_rad)
                     
-                    # 估计指甲盖中心与宽度范围
                     len_px = math.sqrt((tx - dx)**2 + (ty - dy)**2)
                     cx = tx - (tx - dx) * 0.3
                     cy = ty - (ty - dy) * 0.3
@@ -110,10 +110,9 @@ async def scan_nails(
                         "cx": int(cx),
                         "cy": int(cy),
                         "angle": round(angle_deg, 1),
-                        "width_px": int(len_px * 0.55) # AI 自动推荐的初始像素框宽度
+                        "width_px": int(len_px * 0.55)
                     })
             else:
-                # 若没找到手，给出一组默认垂直微调框，绝不报错卡死
                 default_x = [int(w*0.4), int(w*0.5), int(w*0.6), int(w*0.7)]
                 for i, name in enumerate(["Index", "Majeur", "Annulaire", "Auriculaire"]):
                     nails_data.append({
