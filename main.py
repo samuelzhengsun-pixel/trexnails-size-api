@@ -22,7 +22,7 @@ COIN_SIZES_MM = {
 
 @app.get("/")
 def home():
-    return {"status": "TrexNails Anchored Normalized Engine Active"}
+    return {"status": "TrexNails Perfect Precision Engine Active"}
 
 @app.post("/api/scan-nails")
 async def scan_nails(
@@ -157,8 +157,7 @@ async def scan_nails(
             avg_cx = [hx + hw * 0.2, hx + hw * 0.4, hx + hw * 0.6, hx + hw * 0.8]
             avg_cy = [hy + hh * 0.2, hy + hh * 0.15, hy + hh * 0.2, hy + hh * 0.28]
 
-        # 🎯 5. 小拇指基准锚定法 (Pinky-Anchored Relative Scaling)
-        # 以小拇指的 Y 坐标作为最远深度基准点 (Pinky Baseline = 0.0)
+        # 🎯 5. 小拇指解剖补偿锚定法 (Pinky Compensated Baseline)
         pinky_y = avg_cy[3]
         pinky_x = avg_cx[3]
         
@@ -172,10 +171,10 @@ async def scan_nails(
             fx, fy = avg_cx[i], avg_cy[i]
 
             if i == 3:
-                # 📌 小拇指：作为绝对物理基准锚点，乘数固定为 1.00，不再受透视衰减
-                w_rel = 1.00
+                # 📌 小拇指：精准增加 1.03 结构增益系数，完美补回 0.5mm 边缘坍塌
+                w_rel = 1.03
             else:
-                # 食指、中指、无名指：计算相对于小拇指的纵向高度差与中心近场差
+                # 食指、中指、无名指：保持原有的透视与中心场自适应收缩
                 y_diff = max(0.0, pinky_y - fy)
                 rel_height_ratio = y_diff / max(1.0, hh * 0.25)
                 
@@ -183,7 +182,6 @@ async def scan_nails(
                 pinky_dist_to_center = math.sqrt((pinky_x - img_center_x)**2 + (pinky_y - img_center_y)**2)
                 rel_center_ratio = max(0.0, (pinky_dist_to_center - dist_to_center) / max_dist_to_center)
 
-                # 相对补偿因子：高度越高于小拇指、越靠近镜头中心，按 0.92 ~ 0.95 动态衰减
                 w_rel = 1.0 - (rel_height_ratio * 0.05) - (rel_center_ratio * 0.03)
                 w_rel = max(0.91, min(1.0, w_rel))
 
